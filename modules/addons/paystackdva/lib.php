@@ -170,16 +170,62 @@ function paystackdva_activate()
 }
 
 /**
- * Deactivation hook — keep the tables (they hold funding records & dedupe data).
+ * Deactivation hook — close every NUBAN on Paystack, then drop ALL of the
+ * addon's tables.
+ *
+ * WARNING: this is destructive. First each client's dedicated NUBAN is
+ * deactivated on Paystack (so no further transfers are accepted), then every
+ * dedicated-account record, the funding (dedupe) history and the poller state
+ * are removed. Re-activating the addon recreates the tables empty via
+ * paystackdva_activate().
  *
  * @return array
  */
 function paystackdva_deactivate()
 {
-    return [
-        'status'      => 'success',
-        'description' => 'Paystack Dedicated Accounts deactivated. Account records were preserved.',
-    ];
+    // 1) Release the dedicated NUBANs on Paystack while the records still exist.
+    //    Must run BEFORE dropping mod_paystack_dva, which it reads from.
+    $closed = paystackdva_disable_all_accounts();
+
+    // Abort the destructive table-drop if any NUBAN could not be closed on
+    // Paystack — dropping the records now would orphan those accounts (no local
+    // reference left to retry the close). The successfully-closed records remain
+    // (they're harmless empty NUBANs); the admin can fix the failures (e.g.
+    // restore the gateway secret key) and deactivate again to finish.
+    if (($closed['failed'] ?? 0) > 0) {
+        return [
+            'status'      => 'error',
+            'description' => 'Deactivation aborted: ' . (int) $closed['failed'] . ' Paystack account(s) '
+                . 'could not be closed (see Activity Log)'
+                . (($closed['removed'] ?? 0) > 0 ? ', ' . (int) $closed['removed'] . ' were closed' : '')
+                . '. The addon tables were kept so no accounts are orphaned — resolve the failures '
+                . '(e.g. check the Paystack gateway secret key) and deactivate again.',
+        ];
+    }
+
+    // 2) Drop the addon's tables (child/index tables first, then the main one).
+    $tables = ['mod_paystack_dva_tx', 'mod_paystack_dva_state', 'mod_paystack_dva'];
+
+    try {
+        foreach ($tables as $table) {
+            Capsule::schema()->dropIfExists($table);
+        }
+
+        $note = ($closed['removed'] ?? 0) > 0
+            ? ' Closed ' . (int) $closed['removed'] . ' Paystack account(s).'
+            : '';
+
+        return [
+            'status'      => 'success',
+            'description' => 'Paystack Dedicated Accounts deactivated.' . $note
+                . ' All addon tables were dropped — re-activating the addon will recreate them empty.',
+        ];
+    } catch (\Exception $e) {
+        return [
+            'status'      => 'error',
+            'description' => 'Unable to drop tables: ' . $e->getMessage(),
+        ];
+    }
 }
 
 /**

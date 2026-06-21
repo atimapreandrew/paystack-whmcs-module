@@ -16,6 +16,10 @@ Accept payments in WHMCS using Paystack — supporting cards, bank transfers, US
 2. Copy `modules/gateways/paystack.php` to your WHMCS installation's `/modules/gateways/` directory.
 3. Copy `modules/gateways/callback/paystack.php` to `/modules/gateways/callback/` directory.
 
+### Optional: Hide Paystack for non-NGN currencies
+
+To hide Paystack as a payment option whenever the order/invoice currency is not Nigerian Naira (see [Hide for Non-NGN Currencies](#hide-for-non-ngn-currencies)), also copy `includes/hooks/paystack_hide_non_ngn.php` to your WHMCS installation's `/includes/hooks/` directory. The file is inert until you switch the gateway option On, so it is safe to leave in place.
+
 ### Optional: Dedicated Virtual Accounts
 
 To let clients fund their WHMCS balance by bank transfer (see [Dedicated Virtual Accounts](#dedicated-virtual-accounts)), also:
@@ -50,6 +54,16 @@ You can enable or disable individual payment channels from the gateway settings:
 | QR Code | Enable QR Code | Customer scans QR to pay |
 
 If no channels are explicitly enabled, the plugin defaults to card payments.
+
+## Hide for Non-NGN Currencies
+
+Paystack supports several currencies, but you may only want to offer it to customers paying in Nigerian Naira. Enable **Hide for Non-NGN Currencies** in the gateway settings and Paystack is automatically removed from the payment options on any page whose currency is not NGN:
+
+- the order forms, including **One Step Checkout**;
+- the **invoice** payment selector; and
+- **Add Funds**.
+
+The filtering happens server-side, so it can't be bypassed from the browser. This requires the bundled `includes/hooks/paystack_hide_non_ngn.php` file (see [Installation](#optional-hide-paystack-for-non-ngn-currencies)). When the option is Off — or the hook file isn't installed — Paystack behaves exactly as before and is offered for every [supported currency](#supported-currencies).
 
 ## Dedicated Virtual Accounts
 

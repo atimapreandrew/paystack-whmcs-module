@@ -163,6 +163,15 @@ function paystack_config()
             'Description' => 'Enable test mode (uses test API keys)',
             'Default' => '0',
         ],
+        'hideNonNgn' => [
+            'FriendlyName' => 'Hide for Non-NGN Currencies',
+            'Type' => 'yesno',
+            'Description' => 'Hide Paystack from the payment options whenever the order or invoice '
+                . 'currency is not Nigerian Naira (NGN). Applies to the order forms (including One Step '
+                . 'Checkout), the invoice payment selector and Add Funds. Requires the bundled '
+                . 'includes/hooks/paystack_hide_non_ngn.php file to be installed.',
+            'Default' => '',
+        ],
         'liveSecretKey' => [
             'FriendlyName' => 'Live Secret Key',
             'Type' => 'password',

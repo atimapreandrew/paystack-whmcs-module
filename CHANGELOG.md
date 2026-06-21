@@ -1,3 +1,8 @@
+## 3.2.0 (June 21, 2026)
+
+### New Features
+- **Hide for Non-NGN Currencies**: A new gateway toggle that automatically removes Paystack from the payment options on any page whose currency is not Nigerian Naira (NGN) — the order forms (including One Step Checkout), the invoice payment selector, and Add Funds. Filtering runs server-side via the bundled `includes/hooks/paystack_hide_non_ngn.php` hook, which is inert until the option is switched On. When Off, Paystack is offered for every supported currency exactly as before.
+
 ## 3.1.0 (June 15, 2026)
 
 ### New Features
