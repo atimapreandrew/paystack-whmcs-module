@@ -30,8 +30,17 @@ $isWebhookRequest = false;
 
 // Browser-initiated requests fall through to a redirect back to the invoice.
 register_shutdown_function(function () use (&$isWebhookRequest) {
-    if ($isWebhookRequest) {
+    // Skip when output was already sent (e.g. a die() error page) — a header
+    // can't be issued any more — or when a flow already issued its own
+    // redirect, which must not be clobbered.
+    if ($isWebhookRequest || headers_sent()) {
         return;
+    }
+
+    foreach (headers_list() as $header) {
+        if (stripos($header, 'Location:') === 0) {
+            return;
+        }
     }
 
     $invoiceId = filter_input(INPUT_GET, 'invoiceid', FILTER_SANITIZE_NUMBER_INT);
@@ -149,8 +158,34 @@ function verifyTransaction($trxref, $secretKey)
 // Helper: Build invoice view URL for redirects
 // ============================================================
 
+/**
+ * The configured WHMCS System URL (no trailing slash), or '' if unavailable.
+ * Preferred over $_SERVER['HTTP_HOST'] so a spoofed Host header can't steer
+ * redirects or generated callback URLs.
+ */
+function paystack_system_base_url()
+{
+    try {
+        if (class_exists('\WHMCS\Config\Setting')) {
+            $configured = trim((string) \WHMCS\Config\Setting::getValue('SystemURL'));
+            if ($configured !== '') {
+                return rtrim($configured, '/');
+            }
+        }
+    } catch (\Exception $e) {
+        // fall through
+    }
+
+    return '';
+}
+
 function getInvoiceUrl($invoiceId)
 {
+    $base = paystack_system_base_url();
+    if ($base !== '') {
+        return $base . '/viewinvoice.php?id=' . rawurlencode($invoiceId);
+    }
+
     return paystack_request_scheme() . '://' . $_SERVER['HTTP_HOST']
         . substr($_SERVER['REQUEST_URI'], 0, strrpos($_SERVER['REQUEST_URI'], '/'))
         . '/../../../viewinvoice.php?id=' . rawurlencode($invoiceId);
@@ -168,13 +203,11 @@ function validateFallbackSignature($secretKey)
         return false;
     }
 
-    // Rebuild the data that was signed (everything except 'sig')
+    // Rebuild the data that was signed (everything except 'sig'). Only the
+    // invoice ID travels in the URL — everything else is looked up server-side.
     $data = [
-        'invoiceid'    => filter_input(INPUT_GET, 'invoiceid'),
-        'email'        => filter_input(INPUT_GET, 'email'),
-        'phone'        => filter_input(INPUT_GET, 'phone'),
-        'amountinkobo' => filter_input(INPUT_GET, 'amountinkobo'),
-        'go'           => filter_input(INPUT_GET, 'go'),
+        'invoiceid' => filter_input(INPUT_GET, 'invoiceid'),
+        'go'        => filter_input(INPUT_GET, 'go'),
     ];
 
     ksort($data);
@@ -200,13 +233,45 @@ if (strtolower(filter_input(INPUT_GET, 'go') ?? '') === 'standard') {
         die('Invalid request signature. Please try again from the invoice page.');
     }
 
-    $amountInKobo = filter_input(INPUT_GET, 'amountinkobo', FILTER_SANITIZE_NUMBER_INT);
-    $email = filter_input(INPUT_GET, 'email', FILTER_SANITIZE_EMAIL);
-    $phone = filter_input(INPUT_GET, 'phone');
+    // Look everything up server-side from the (signed) invoice ID so the
+    // email, phone and amount can neither be tampered with nor leak via the URL.
+    $invoiceData = localAPI('GetInvoice', ['invoiceid' => $invoiceId]);
+    if (($invoiceData['result'] ?? '') !== 'success' || ($invoiceData['status'] ?? '') !== 'Unpaid') {
+        header('Location: ' . getInvoiceUrl($invoiceId));
+        exit;
+    }
+
+    $client = Capsule::table('tblclients')
+        ->where('id', (int) $invoiceData['userid'])
+        ->first(['email', 'phonenumber', 'currency']);
+
+    if (!$client) {
+        header('Location: ' . getInvoiceUrl($invoiceId));
+        exit;
+    }
+
+    // Amount due in the gateway's charge currency (mirror the link flow's
+    // conversion when "Convert To For Processing" is configured).
+    $amountDue = (float) $invoiceData['balance'];
+    if ($gatewayParams['convertto']) {
+        $amountDue = convertCurrency($amountDue, $client->currency, $gatewayParams['convertto']);
+    }
+    $amountInKobo = (int) round($amountDue * 100);
+
+    if ($amountInKobo <= 0) {
+        header('Location: ' . getInvoiceUrl($invoiceId));
+        exit;
+    }
+
+    $email = $client->email;
+    $phone = $client->phonenumber;
     $txnref = $invoiceId . '_' . time();
 
-    $callbackUrl = paystack_request_scheme() . '://' . $_SERVER['HTTP_HOST']
-        . $_SERVER['SCRIPT_NAME'] . '?invoiceid=' . rawurlencode($invoiceId);
+    $systemBase = paystack_system_base_url();
+    $callbackUrl = ($systemBase !== ''
+            ? $systemBase . '/modules/gateways/callback/paystack.php'
+            : paystack_request_scheme() . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'])
+        . '?invoiceid=' . rawurlencode($invoiceId);
 
     // Initialize transaction with Paystack
     $ch = curl_init();
@@ -273,17 +338,16 @@ if (isset($event->event) && strtoupper($_SERVER['REQUEST_METHOD']) === 'POST') {
 
     $mode = ($gatewayParams['testMode'] === 'on') ? 'test' : 'live';
 
-    // Always record that a webhook reached the endpoint (diagnostic, not gated
-    // on the Gateway Logs setting) so a missing/misconfigured webhook is obvious.
-    logActivity('Paystack webhook received: ' . $event->event . ' (' . $mode . ' mode)');
-
-    // Validate webhook signature
+    // Validate webhook signature BEFORE logging anything derived from the
+    // payload — otherwise anyone could flood the Activity Log with arbitrary
+    // event names via unauthenticated POSTs.
     $signature = $_SERVER['HTTP_X_PAYSTACK_SIGNATURE'] ?? '';
     $expectedSignature = hash_hmac('sha512', $input, $secretKey);
 
     if (!$signature || !hash_equals($expectedSignature, $signature)) {
         // Most often this means the webhook is configured for the OTHER mode:
         // a Test-mode webhook is signed with the test secret key and vice versa.
+        // (Fixed message only — no attacker-controlled content is logged.)
         logActivity('Paystack webhook signature mismatch — check that the webhook in your '
             . 'Paystack dashboard is on the same mode (' . $mode . ') as the gateway, and that '
             . 'the matching secret key is saved in WHMCS.');
@@ -293,6 +357,11 @@ if (isset($event->event) && strtoupper($_SERVER['REQUEST_METHOD']) === 'POST') {
         http_response_code(401);
         exit;
     }
+
+    // Signature is genuine — record that the webhook reached the endpoint
+    // (diagnostic, not gated on the Gateway Logs setting) so a missing or
+    // misconfigured webhook is obvious.
+    logActivity('Paystack webhook received: ' . $event->event . ' (' . $mode . ' mode)');
 
     // Log all webhook events if logging is enabled
     if ($enableLogs) {
@@ -314,21 +383,15 @@ if (isset($event->event) && strtoupper($_SERVER['REQUEST_METHOD']) === 'POST') {
             // "dedicated_nuban" channel and a Paystack-generated reference that
             // is NOT in our "invoiceid_timestamp" format. These credit the
             // client's WHMCS funds balance instead of paying an invoice.
+            //
+            // IMPORTANT: the routing decision is made on the CHANNEL ONLY. A
+            // client who owns a dedicated account carries the same Paystack
+            // customer_code on their ordinary card/checkout invoice payments,
+            // so matching on customer_code here would wrongly send invoice
+            // payments to the wallet (invoice paid AND balance credited).
             $isDva = (($event->data->channel ?? '') === 'dedicated_nuban');
-            $customerCode = $event->data->customer->customer_code ?? null;
 
-            $dvaRow = null;
-            if (function_exists('paystackdva_get_account') && $customerCode) {
-                try {
-                    $dvaRow = Capsule::table('mod_paystack_dva')
-                        ->where('customer_code', $customerCode)
-                        ->first();
-                } catch (\Exception $e) {
-                    $dvaRow = null;
-                }
-            }
-
-            if ($isDva || $dvaRow) {
+            if ($isDva) {
                 // Verify server-side before crediting (don't trust webhook alone).
                 $txStatus = verifyTransaction($trxref, $secretKey);
 
@@ -345,24 +408,36 @@ if (isset($event->event) && strtoupper($_SERVER['REQUEST_METHOD']) === 'POST') {
                     exit;
                 }
 
-                // Resolve the WHMCS client from the dedicated-account record.
-                if (!$dvaRow) {
-                    $verifiedCode = $txStatus->customer->customer_code ?? $customerCode;
-                    $receiver = $txStatus->metadata->receiver_account_number
-                        ?? ($event->data->metadata->receiver_account_number ?? null);
-                    try {
-                        $query = Capsule::table('mod_paystack_dva');
-                        if ($verifiedCode) {
-                            $query->where('customer_code', $verifiedCode);
-                        } elseif ($receiver) {
-                            $query->where('account_number', $receiver);
-                        } else {
-                            $query->whereRaw('1 = 0');
-                        }
-                        $dvaRow = $query->first();
-                    } catch (\Exception $e) {
-                        $dvaRow = null;
+                // The VERIFIED transaction must also be on the dedicated_nuban
+                // channel — the webhook body is not trusted for routing money.
+                if (($txStatus->channel ?? '') !== 'dedicated_nuban') {
+                    logActivity('Paystack DVA: webhook for ' . $trxref . ' claimed dedicated_nuban '
+                        . 'but the verified channel is "' . ($txStatus->channel ?? 'unknown')
+                        . '" — not credited.');
+                    http_response_code(200);
+                    exit;
+                }
+
+                // Resolve the WHMCS client from the dedicated-account record,
+                // preferring the verified customer_code over the webhook body's.
+                $customerCode = $txStatus->customer->customer_code
+                    ?? ($event->data->customer->customer_code ?? null);
+                $receiver = $txStatus->metadata->receiver_account_number
+                    ?? ($event->data->metadata->receiver_account_number ?? null);
+
+                $dvaRow = null;
+                try {
+                    $query = Capsule::table('mod_paystack_dva');
+                    if ($customerCode) {
+                        $query->where('customer_code', $customerCode);
+                    } elseif ($receiver) {
+                        $query->where('account_number', $receiver);
+                    } else {
+                        $query->whereRaw('1 = 0');
                     }
+                    $dvaRow = $query->first();
+                } catch (\Exception $e) {
+                    $dvaRow = null;
                 }
 
                 if (!$dvaRow) {
@@ -381,71 +456,27 @@ if (isset($event->event) && strtoupper($_SERVER['REQUEST_METHOD']) === 'POST') {
                 $fundAmount = floatval($txStatus->amount) / 100;
                 $fundCurrency = $txStatus->currency ?? ($dvaRow->currency ?? 'NGN');
 
-                // Dedupe: the unique reference index rejects replays.
-                try {
-                    Capsule::table('mod_paystack_dva_tx')->insert([
-                        'reference'  => $trxref,
-                        'userid'     => $dvaRow->userid,
-                        'amount'     => $fundAmount,
-                        'currency'   => $fundCurrency,
-                        'created_at' => date('Y-m-d H:i:s'),
-                    ]);
-                } catch (\Exception $e) {
-                    // Already processed — acknowledge and stop.
-                    http_response_code(200);
-                    exit;
-                }
+                // Dedupe (unique reference), the NGN-only guards, AddCredit with
+                // rollback-on-failure, activity logging and the PaystackDvaFunded
+                // notification hook all live in paystackdva_credit_deposit(),
+                // shared with the cron poller so the two paths can never
+                // double-credit the same deposit.
+                $credited = function_exists('paystackdva_credit_deposit')
+                    && paystackdva_credit_deposit((int) $dvaRow->userid, $trxref, $fundAmount, $fundCurrency);
 
-                // Credit the client's funds/credit balance.
-                $apiResult = localAPI('AddCredit', [
-                    'clientid'    => $dvaRow->userid,
-                    'description' => 'Paystack dedicated account funding (' . $trxref . ')',
-                    'amount'      => $fundAmount,
-                ]);
-
-                if (($apiResult['result'] ?? '') !== 'success') {
-                    // Roll back the dedupe row so a webhook retry can re-attempt.
-                    try {
-                        Capsule::table('mod_paystack_dva_tx')->where('reference', $trxref)->delete();
-                    } catch (\Exception $e) {
-                        // ignore
-                    }
-                    logActivity('Paystack DVA: AddCredit failed for client ' . $dvaRow->userid
-                        . ' (' . $trxref . ') — ' . ($apiResult['message'] ?? 'unknown error'));
+                if ($credited) {
                     if ($enableLogs) {
                         logTransaction($gatewayModuleName, [
                             'reference' => $trxref,
                             'userid'    => $dvaRow->userid,
-                            'error'     => $apiResult['message'] ?? 'AddCredit failed',
-                        ], 'DVA Funding Failed');
+                            'amount'    => $fundAmount,
+                            'currency'  => $fundCurrency,
+                            'account'   => $dvaRow->account_number,
+                        ], 'DVA Funding Credited');
                     }
-                    http_response_code(200);
-                    exit;
-                }
 
-                logActivity('Paystack DVA: credited ' . $fundAmount . ' ' . $fundCurrency
-                    . ' to client ' . $dvaRow->userid . ' (' . $trxref . ')');
-                if ($enableLogs) {
-                    logTransaction($gatewayModuleName, [
-                        'reference' => $trxref,
-                        'userid'    => $dvaRow->userid,
-                        'amount'    => $fundAmount,
-                        'currency'  => $fundCurrency,
-                        'account'   => $dvaRow->account_number,
-                    ], 'DVA Funding Credited');
-                }
-
-                $tracker = new PaystackPluginTracker('whmcs', $publicKey);
-                $tracker->logSuccess($trxref);
-
-                // Notify (handled by the separate funds-notification hook).
-                if (function_exists('run_hook')) {
-                    run_hook('PaystackDvaFunded', [
-                        'userid'   => $dvaRow->userid,
-                        'amount'   => $fundAmount,
-                        'currency' => $fundCurrency,
-                        'transid'  => $trxref,
-                    ]);
+                    $tracker = new PaystackPluginTracker('whmcs', $publicKey);
+                    $tracker->logSuccess($trxref);
                 }
 
                 http_response_code(200);
@@ -618,9 +649,17 @@ if (isset($event->event) && strtoupper($_SERVER['REQUEST_METHOD']) === 'POST') {
 if (strtoupper($_SERVER['REQUEST_METHOD'] ?? '') === 'POST'
     && !empty($_SERVER['HTTP_X_PAYSTACK_SIGNATURE'])) {
     $isWebhookRequest = true;
-    logActivity('Paystack webhook POST received but body could not be parsed as an event. '
-        . 'Raw length: ' . strlen($input) . ' bytes.');
-    http_response_code(200);
+
+    // Only log when the signature is genuine — otherwise this too would be an
+    // unauthenticated Activity Log flood vector.
+    $expectedSignature = hash_hmac('sha512', $input, $secretKey);
+    if (hash_equals($expectedSignature, (string) $_SERVER['HTTP_X_PAYSTACK_SIGNATURE'])) {
+        logActivity('Paystack webhook POST received but body could not be parsed as an event. '
+            . 'Raw length: ' . strlen($input) . ' bytes.');
+        http_response_code(200);
+    } else {
+        http_response_code(401);
+    }
     exit;
 }
 
@@ -629,14 +668,29 @@ if (strtoupper($_SERVER['REQUEST_METHOD'] ?? '') === 'POST'
 // FLOW 3: Browser redirect — User returning from Paystack checkout
 // ============================================================
 
-$invoiceId = filter_input(INPUT_GET, 'invoiceid', FILTER_SANITIZE_NUMBER_INT);
+$invoiceIdParam = (int) filter_input(INPUT_GET, 'invoiceid', FILTER_SANITIZE_NUMBER_INT);
 $trxref = filter_input(INPUT_GET, 'trxref');
 
-if (!$trxref || !$invoiceId) {
-    if ($invoiceId) {
-        header('Location: ' . getInvoiceUrl($invoiceId));
+if (!$trxref || !$invoiceIdParam) {
+    if ($invoiceIdParam) {
+        header('Location: ' . getInvoiceUrl($invoiceIdParam));
     }
     exit;
+}
+
+// The invoice a payment belongs to is encoded in the reference itself
+// ("invoiceid_timestamp"). Derive it from there instead of trusting the
+// separate invoiceid parameter, so a valid payment for one invoice can never
+// be applied to a different one by tampering with the URL.
+if (!preg_match('/^\d+_\d+$/', $trxref)) {
+    header('Location: ' . getInvoiceUrl($invoiceIdParam));
+    exit;
+}
+
+$invoiceId = (int) explode('_', $trxref)[0];
+if ($invoiceId !== $invoiceIdParam) {
+    logActivity('Paystack: invoiceid parameter (' . $invoiceIdParam . ') does not match transaction '
+        . 'reference ' . $trxref . ' — using the invoice from the reference.');
 }
 
 $txStatus = verifyTransaction($trxref, $secretKey);
@@ -691,6 +745,11 @@ try {
         // Allow a small tolerance (0.01) for rounding differences
         // but flag significant underpayments
         if ($paidAmount < ($invoiceTotal - 0.01)) {
+            // Always record underpayments in the Activity Log — this is a
+            // possible tampering signal and must not depend on the Gateway
+            // Logs setting being enabled.
+            logActivity('Paystack: payment ' . $trxref . ' underpaid invoice ' . $invoiceId
+                . ' (paid ' . $paidAmount . ' of ' . $invoiceTotal . ') — applied as a partial payment.');
             if ($enableLogs) {
                 logTransaction($gatewayModuleName, [
                     'reference'      => $trxref,

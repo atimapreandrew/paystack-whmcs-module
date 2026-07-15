@@ -52,8 +52,26 @@ add_hook("ClientAreaPage", 1, function ($vars) {
         paystackdva_respond($isAjax, "error", "Please log in and try again.");
     }
 
-    // WHMCS validates the CSRF token automatically for POSTs carrying one.
-    if (empty($_POST["token"])) {
+    // NGN-only: virtual accounts are never generated for clients billed in
+    // another currency (their deposits could not be credited correctly).
+    if (!paystackdva_client_is_ngn($userid)) {
+        paystackdva_respond(
+            $isAjax,
+            "error",
+            "Virtual accounts are only available for accounts billed in NGN.",
+        );
+    }
+
+    // CSRF: WHMCS core validates the standard token on client-area POSTs; the
+    // module nonce is validated here as well so the protection is
+    // self-contained and does not depend on that core behaviour.
+    $nonce = (string) ($_POST["paystackdva_nonce"] ?? "");
+    $sessionNonce = (string) ($_SESSION["paystackdva_nonce"] ?? "");
+    if (
+        empty($_POST["token"]) ||
+        $sessionNonce === "" ||
+        !hash_equals($sessionNonce, $nonce)
+    ) {
         paystackdva_respond(
             $isAjax,
             "error",
@@ -150,10 +168,19 @@ function paystackdva_respond($isAjax, $status, $message = "", $html = "")
  *   {$paystackdva_account}         — array: account_number, bank_name,
  *                                    account_name, status, currency
  *   {$paystackdva_token}           — CSRF token value (for custom markup)
+ *   {$paystackdva_nonce}           — module CSRF nonce; custom generate forms
+ *                                    must POST it as "paystackdva_nonce"
+ *
+ * The variables are only exposed for clients whose account currency is NGN —
+ * dedicated accounts are NGN-only, so other clients never see the feature.
  */
 add_hook("ClientAreaPage", 2, function ($vars) {
     $userid = (int) ($_SESSION["uid"] ?? 0);
-    if ($userid <= 0 || !paystackdva_enabled()) {
+    if (
+        $userid <= 0 ||
+        !paystackdva_enabled() ||
+        !paystackdva_client_is_ngn($userid)
+    ) {
         return [];
     }
 
@@ -173,8 +200,24 @@ add_hook("ClientAreaPage", 2, function ($vars) {
         "paystackdva_token" => function_exists("generate_token")
             ? generate_token("plain")
             : "",
+        "paystackdva_nonce" => paystackdva_nonce(),
     ];
 });
+
+/**
+ * Per-session anti-CSRF nonce for the generate action, validated with
+ * hash_equals() in the POST handler. Self-contained so the protection holds
+ * even if WHMCS core token validation is unavailable.
+ *
+ * @return string
+ */
+function paystackdva_nonce()
+{
+    if (empty($_SESSION["paystackdva_nonce"])) {
+        $_SESSION["paystackdva_nonce"] = bin2hex(random_bytes(16));
+    }
+    return (string) $_SESSION["paystackdva_nonce"];
+}
 
 /**
  * Build the full sidebar panel body (account block or generate form + script).
@@ -234,6 +277,9 @@ function paystackdva_panel_html($account, $flash, $canGenerate = true)
         "</div>" .
         '<form method="post" action="" id="paystackdva-form">' .
         $token .
+        '<input type="hidden" name="paystackdva_nonce" value="' .
+        htmlspecialchars(paystackdva_nonce()) .
+        '">' .
         '<input type="hidden" name="paystackdva_action" value="generate">' .
         '<input type="hidden" name="paystackdva_ajax" value="1">' .
         '<button type="submit" id="paystackdva-btn" class="btn btn-primary-faded btn-block">' .

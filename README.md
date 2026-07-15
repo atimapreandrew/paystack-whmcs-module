@@ -66,7 +66,7 @@ No extra webhook configuration is needed — it reuses the same Webhook URL and 
 ### Requirements & notes
 
 - **Dedicated NUBAN must be enabled on your Paystack account.** In live mode this requires completed KYC / business approval. In **test mode** the module provisions accounts on `test-bank`.
-- Dedicated accounts are **NGN-only** (the sidebar clearly notes "NGN Deposits only"), so this is intended for clients whose WHMCS currency is NGN.
+- Dedicated accounts are **NGN-only, and this is enforced**: the Virtual Account panel only appears for clients whose WHMCS account currency is NGN, account generation is refused for any other currency, and deposits are never credited to a non-NGN client (they are logged in the Activity Log for manual handling instead).
 - One account is provisioned per client (re-clicking simply shows the existing account).
 - The live provisioning bank defaults to **Paystack Titan** (`titan-paystack`) and is selectable in the addon's settings.
 - If Paystack provisions the account asynchronously, the sidebar shows a "being created" state and the account is completed automatically via the `dedicatedaccount.assign.success` webhook.

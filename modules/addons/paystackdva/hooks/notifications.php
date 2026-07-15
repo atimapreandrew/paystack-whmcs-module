@@ -27,8 +27,12 @@ require_once __DIR__ . '/../lib.php';
 /**
  * Standard Add Funds deposits (any gateway).
  *
- * AddInvoicePayment fires for every invoice payment, so we only act when the
- * paid invoice is an "Add Funds" invoice (identified by an AddFunds line item).
+ * AddInvoicePayment fires for every invoice payment — including PARTIAL
+ * payments — and per the WHMCS hook docs it receives only {invoiceid}. So we
+ * act only when the paid invoice is an "Add Funds" invoice (identified by an
+ * AddFunds line item) AND it is now fully Paid — WHMCS only credits the funds
+ * balance once the Add Funds invoice is paid in full, so emailing on a partial
+ * payment would announce credit the client hasn't received yet.
  */
 add_hook('AddInvoicePayment', 1, function ($vars) {
     $invoiceId = (int) ($vars['invoiceid'] ?? 0);
@@ -48,18 +52,29 @@ add_hook('AddInvoicePayment', 1, function ($vars) {
 
         $invoice = Capsule::table('tblinvoices')
             ->where('id', $invoiceId)
-            ->first(['userid', 'total']);
+            ->first(['userid', 'total', 'status']);
 
-        if (!$invoice) {
-            return;
+        if (!$invoice || $invoice->status !== 'Paid') {
+            return; // partially paid — funds not credited yet
         }
 
-        $amount = $vars['amount'] ?? $invoice->total;
+        // The hook only provides the invoice ID; resolve the reference from
+        // the most recent transaction recorded against the invoice.
+        $transid = '';
+        try {
+            $transid = (string) Capsule::table('tblaccounts')
+                ->where('invoiceid', $invoiceId)
+                ->orderBy('id', 'desc')
+                ->value('transid');
+        } catch (\Exception $e) {
+            // optional detail only
+        }
+
         paystack_send_funds_email(
             (int) $invoice->userid,
-            (float) $amount,
+            (float) $invoice->total,
             'your selected payment method',
-            $vars['transid'] ?? ''
+            $transid
         );
     } catch (\Exception $e) {
         logActivity('Add Funds notification error: ' . $e->getMessage());

@@ -41,7 +41,7 @@ function paystackdva_config()
         'description' => 'Clients generate a personal Paystack dedicated bank account (NGN) and fund '
             . 'their WHMCS balance by transfer. Also reconciles "stuck" invoice payments. '
             . 'Uses the API keys from your Paystack gateway — no keys are entered here.',
-        'version'     => '1.1.0',
+        'version'     => '1.2.0',
         'author'      => 'Paystack',
         'language'    => 'english',
         'fields'      => [
@@ -428,6 +428,35 @@ function paystackdva_client_eligible($userid)
 }
 
 /**
+ * Whether a client's WHMCS account currency is NGN.
+ *
+ * Dedicated accounts are strictly NGN-only: deposits arrive in naira and
+ * AddCredit credits the client's balance in THEIR OWN currency at face value,
+ * so crediting a non-NGN client would be wildly wrong (₦10,000 would become
+ * $10,000 for a USD client). Fails CLOSED (false) on lookup errors — for
+ * money movement it is safer to refuse than to guess.
+ *
+ * @param int $userid
+ * @return bool
+ */
+function paystackdva_client_is_ngn($userid)
+{
+    $userid = (int) $userid;
+    if ($userid <= 0) {
+        return false;
+    }
+    try {
+        $code = Capsule::table('tblclients')
+            ->join('tblcurrencies', 'tblcurrencies.id', '=', 'tblclients.currency')
+            ->where('tblclients.id', $userid)
+            ->value('tblcurrencies.code');
+        return strtoupper(trim((string) $code)) === 'NGN';
+    } catch (\Exception $e) {
+        return false;
+    }
+}
+
+/**
  * Whether the given client may generate a dedicated account right now.
  *
  * @param int $userid
@@ -778,6 +807,12 @@ function paystackdva_create_account($client)
         return ['account' => $existing, 'existing' => true];
     }
 
+    // NGN-only: never provision an account for a client billed in another
+    // currency — their deposits could not be credited correctly.
+    if (!paystackdva_client_is_ngn($userid)) {
+        return ['error' => 'Virtual accounts are only available for accounts billed in NGN.'];
+    }
+
     $keys = paystackdva_keys();
     if (empty($keys['secret'])) {
         return ['error' => 'Paystack gateway is not configured. Please contact support.'];
@@ -938,6 +973,20 @@ function paystackdva_credit_deposit($userid, $reference, $amount, $currency = 'N
         return false;
     }
 
+    // NGN-only: refuse unless BOTH the deposit currency and the client's
+    // account currency are NGN — AddCredit credits the client's own currency
+    // at face value, so anything else would credit the wrong amount. The
+    // reference is deliberately NOT claimed, so the deposit can still be
+    // credited later (e.g. after an admin corrects the client's currency)
+    // while it remains inside the poller's window.
+    if (strtoupper(trim((string) $currency)) !== 'NGN' || !paystackdva_client_is_ngn($userid)) {
+        logActivity('Paystack DVA: refused to credit ' . $amount . ' ' . $currency
+            . ' to client ' . $userid . ' (' . $reference . ') — dedicated-account funding is '
+            . 'NGN-only and requires the client\'s account currency to be NGN. Credit it '
+            . 'manually or fix the client\'s currency.');
+        return false;
+    }
+
     // Dedupe — claim the reference first. A duplicate key means it's already done.
     try {
         Capsule::table('mod_paystack_dva_tx')->insert([
@@ -1049,6 +1098,21 @@ function paystackdva_apply_invoice_payment($tx, $gatewayParams)
     } catch (\Exception $e) {
         return false;
     }
+
+    // Re-verify the transaction directly with Paystack before moving money
+    // (defense in depth — don't apply a payment off the list response alone).
+    $keys = paystackdva_keys();
+    if (empty($keys['secret'])) {
+        return false;
+    }
+    $verified = paystackdva_api(
+        'https://api.paystack.co/transaction/verify/' . rawurlencode($reference),
+        $keys['secret']
+    );
+    if (isset($verified->error) || ($verified->status ?? '') !== 'success') {
+        return false;
+    }
+    $tx = $verified;
 
     // Ensure WHMCS payment helpers are available in cron/CLI context.
     if (!function_exists('addInvoicePayment')) {

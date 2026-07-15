@@ -1,3 +1,21 @@
+## 3.1.1 (July 16, 2026)
+
+### Critical Bug Fixes
+- **Invoice payments no longer get credited to the client's wallet**: the webhook routed a `charge.success` to the dedicated-account (wallet top-up) branch whenever the payer's Paystack `customer_code` existed in the DVA table — which is true for every ordinary card/checkout payment made by a client who owns a dedicated account. Those clients ended up with the invoice marked paid AND the full amount added to their credit balance. Routing is now decided by the transaction channel only (`dedicated_nuban`), and the channel is re-checked on the server-verified transaction before any credit.
+- **NGN-only enforcement for dedicated accounts**: previously a naira deposit was credited at face value in the client's own currency (₦10,000 → $10,000 for a USD client). Now the Virtual Account panel is only shown to clients whose WHMCS account currency is NGN, generation is refused server-side for any other currency, and deposits are never credited unless both the deposit and the client's currency are NGN (refusals are logged for manual handling, without claiming the reference so a later retry can still credit it).
+
+### Security Fixes
+- **Browser-return flow binds the payment to its invoice**: the invoice ID is now derived from the transaction reference (`invoiceid_timestamp`) instead of trusting the separate `invoiceid` URL parameter, so a valid payment for one invoice can no longer be applied to a different invoice via URL tampering. The reference format is also validated.
+- **Fallback checkout URL carries no PII or amount**: only the (HMAC-signed) invoice ID travels in the URL; the callback now looks up the client's email, phone, and the amount due server-side — removing both the tampering surface and email/phone leakage into access logs and browser history.
+- **Webhook logging hardened against flooding**: nothing derived from the payload is written to the Activity Log until the `X-Paystack-Signature` is verified; the malformed-body diagnostic also requires a valid signature (invalid ones get a plain 401).
+- **Self-contained CSRF nonce on the generate action**: the client-area "Generate Virtual Account" POST now validates a per-session module nonce with `hash_equals()` in addition to the standard WHMCS token (exposed to custom templates as `{$paystackdva_nonce}`).
+- **Generated URLs no longer trust the Host header**: callback, webhook, and invoice-redirect URLs are built from the configured WHMCS System URL where available.
+- **Underpayments are always logged** to the Activity Log (previously only when Gateway Logs was enabled), since an amount mismatch is a possible tampering signal.
+- **Poller re-verifies before reconciling**: stuck invoice payments found by the reconciliation poller are re-verified against `transaction/verify` before being applied.
+
+### Improvements
+- The inline popup now actually falls back to the server-side hosted checkout when Paystack's `inline.js` fails to load (the fallback URL was previously generated but never used, and a failed `inline.js` load broke the pay button entirely).
+
 ## 3.1.0 (June 15, 2026)
 
 ### New Features

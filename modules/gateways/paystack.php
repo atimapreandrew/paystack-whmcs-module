@@ -39,6 +39,30 @@ function paystack_base_url()
 }
 
 /**
+ * Helper: Base URL for building callback links.
+ *
+ * Prefers the configured WHMCS System URL so a spoofed Host header can't
+ * influence generated URLs; falls back to header-based detection.
+ *
+ * @return string Base URL without a trailing slash.
+ */
+function paystack_system_url()
+{
+    try {
+        if (class_exists('\WHMCS\Config\Setting')) {
+            $configured = trim((string) \WHMCS\Config\Setting::getValue('SystemURL'));
+            if ($configured !== '') {
+                return rtrim($configured, '/');
+            }
+        }
+    } catch (\Exception $e) {
+        // fall through to header-based detection
+    }
+
+    return paystack_base_url();
+}
+
+/**
  * Helper: Get active keys based on test/live mode.
  *
  * @param array $params Gateway params
@@ -137,7 +161,7 @@ function paystack_supported_currencies()
  */
 function paystack_config()
 {
-    $callbackUrl = paystack_base_url() . '/modules/gateways/callback/paystack.php';
+    $callbackUrl = paystack_system_url() . '/modules/gateways/callback/paystack.php';
 
     return [
         'FriendlyName' => [
@@ -293,20 +317,26 @@ function paystack_link($params)
     $channels = paystack_get_channels($params);
     $channelsJs = json_encode($channels);
 
+    // Prefer the WHMCS System URL over request headers for generated URLs.
+    $baseUrl = rtrim(trim($params['systemurl'] ?? ''), '/');
+    if ($baseUrl === '') {
+        $baseUrl = paystack_system_url();
+    }
+
     // On success the popup redirects here with the trxref to verify against.
-    $callbackUrl = paystack_base_url() . '/modules/gateways/callback/paystack.php?'
+    $callbackUrl = $baseUrl . '/modules/gateways/callback/paystack.php?'
         . http_build_query(['invoiceid' => $invoiceId]);
 
-    // Fallback URL: server-side initialization if the inline popup fails to load.
+    // Fallback URL: server-side initialization if the inline popup fails to
+    // load. It carries ONLY the invoice ID — the callback looks up the client's
+    // email, phone and the amount due itself, so no PII or amount rides in the
+    // URL (or in access logs / browser history).
     $fallbackData = [
-        'invoiceid'    => $invoiceId,
-        'email'        => $email,
-        'phone'        => $phone,
-        'amountinkobo' => $amountInKobo,
-        'go'           => 'standard',
+        'invoiceid' => $invoiceId,
+        'go'        => 'standard',
     ];
     $fallbackData['sig'] = paystack_sign_params($fallbackData, $secretKey);
-    $fallbackUrl = paystack_base_url() . '/modules/gateways/callback/paystack.php?'
+    $fallbackUrl = $baseUrl . '/modules/gateways/callback/paystack.php?'
         . http_build_query($fallbackData);
 
     $metadata = json_encode([
@@ -354,16 +384,24 @@ function paystack_link($params)
         }
     })();
 
-    var paystackPop = new PaystackPop();
     var paystack_paying = false;
 
     function payWithPaystack() {
         if (paystack_paying) return;
+
+        if (typeof PaystackPop === "undefined") {
+            // inline.js failed to load (blocked/offline) — fall back to the
+            // server-side hosted checkout flow.
+            window.location.href = ' . json_encode($fallbackUrl) . ';
+            return;
+        }
+
         paystack_paying = true;
 
         var btn = document.getElementById("paystack-pay-btn");
         if (btn) { btn.disabled = true; btn.textContent = "Processing..."; }
 
+        var paystackPop = new PaystackPop();
         paystackPop.checkout({
             key: ' . json_encode($publicKey) . ',
             email: ' . json_encode($email) . ',
