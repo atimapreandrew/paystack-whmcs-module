@@ -14,6 +14,8 @@
 - **Poller re-verifies before reconciling**: stuck invoice payments found by the reconciliation poller are re-verified against `transaction/verify` before being applied.
 
 ### Improvements
+- **Invoice reconciliation is now off by default**: the poller's "Reconcile Invoice Payments" feature only runs when an admin explicitly sets it to On in the addon configuration (fail-closed, including on fresh installs where the setting was never saved).
+- The "Funds Added" email for standard Add Funds deposits is now sent only when the Add Funds invoice is fully paid (the `AddInvoicePayment` hook also fires on partial payments, which would have announced credit before WHMCS actually applied it), and the transaction reference is resolved from the invoice's recorded transactions.
 - The inline popup now actually falls back to the server-side hosted checkout when Paystack's `inline.js` fails to load (the fallback URL was previously generated but never used, and a failed `inline.js` load broke the pay button entirely).
 
 ## 3.1.0 (June 15, 2026)

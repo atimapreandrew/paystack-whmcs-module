@@ -25,7 +25,7 @@ To let clients fund their WHMCS balance by bank transfer (see [Dedicated Virtual
 Then:
 - Activate the addon under **Setup → Addon Modules → Paystack Dedicated Accounts → Activate** (this creates the database tables and the email template).
 - Open the addon's **Configure** screen and set **Enable Dedicated Accounts** to On (plus the live provider bank). All dedicated-account settings live here; the Paystack gateway only supplies the shared API keys.
-- Make sure the WHMCS cron runs every few minutes (Setup → Automation Settings), or add the standalone poller (`modules/addons/paystackdva/poll.php`) to your server cron — this credits deposits and reconciles any payments the webhook misses.
+- Make sure the WHMCS cron runs every few minutes (Setup → Automation Settings), or add the standalone poller (`modules/addons/paystackdva/poll.php`) to your server cron — this credits deposits the webhook misses. It can also reconcile "stuck" invoice payments, but that is **off by default**: an admin must explicitly set **Reconcile Invoice Payments** to On in the addon's Configure screen.
 
 ## Configuration
 

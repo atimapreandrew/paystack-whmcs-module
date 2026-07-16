@@ -79,10 +79,11 @@ function paystackdva_config()
                 'FriendlyName' => 'Reconcile Invoice Payments',
                 'Type'         => 'dropdown',
                 'Options'      => 'on,off',
-                'Default'      => 'on',
+                'Default'      => 'off',
                 'Description'  => 'During polling, also catch successful Paystack invoice payments that '
                     . 'never completed in the browser (customer closed the page, lost connection, etc.) '
-                    . 'and mark the matching WHMCS invoice paid. Uses the same API calls — no extra cost.',
+                    . 'and mark the matching WHMCS invoice paid. Uses the same API calls — no extra cost. '
+                    . 'OFF by default — reconciliation only runs when an admin explicitly turns it On here.',
             ],
             'pollToken' => [
                 'FriendlyName' => 'Poll Secret Token (web cron only)',
@@ -545,7 +546,8 @@ function paystackdva_output($vars)
     // ---- Status panel ----
     $keys = paystackdva_keys();
     $featureOn = paystackdva_enabled();
-    $reconcileOn = (paystackdva_setting('reconcileInvoices', 'on') !== 'off');
+    // Fail closed: reconciliation runs ONLY when explicitly set to "on".
+    $reconcileOn = (paystackdva_setting('reconcileInvoices', 'off') === 'on');
     $mode = !empty($keys['secret']) ? ($keys['testMode'] ? 'Test' : 'Live') : 'Not configured';
 
     $count = 0;
@@ -651,10 +653,11 @@ function paystackdva_output($vars)
             . '<td>' . number_format((float) $userFunded, 2) . ' ' . htmlspecialchars($row->currency ?: 'NGN') . '</td>'
             . '<td>' . htmlspecialchars($row->created_at ?: '—') . '</td>'
             . '<td><form method="post" action="' . htmlspecialchars($modulelink) . '" style="margin:0;" '
-            . 'onsubmit="return confirm(\'Disable and delete this dedicated account?\');">'
+            . 'onsubmit="return confirm(\'Disable and delete this dedicated account? The NUBAN will be '
+            . 'closed on Paystack and the client can generate a new one. Funding history is kept.\');">'
             . $token
             . '<input type="hidden" name="paystackdva_disable_user" value="' . (int) $row->userid . '">'
-            . '<button type="submit" class="btn btn-danger btn-sm">Disable</button>'
+            . '<button type="submit" class="btn btn-danger btn-sm">Disable &amp; Delete</button>'
             . '</form></td>'
             . '</tr>';
     }
@@ -1234,7 +1237,9 @@ function paystackdva_poll()
     }
 
     // Invoice reconciliation is independent of dedicated accounts.
-    $reconcileInvoices = (paystackdva_setting('reconcileInvoices', 'on') !== 'off');
+    // Fail closed: it runs ONLY when explicitly set to "on" in the addon
+    // configuration (off by default, including on fresh/unsaved installs).
+    $reconcileInvoices = (paystackdva_setting('reconcileInvoices', 'off') === 'on');
     $gatewayParams = $reconcileInvoices ? getGatewayVariables('paystack') : [];
 
     // If there are no dedicated accounts AND invoice reconciliation is off, there
